@@ -11,6 +11,9 @@ mod workbook_tests {
     use crate::{xmlwriter, Table, Workbook};
     use pretty_assertions::assert_eq;
 
+    #[cfg(feature = "constant_memory")]
+    use crate::worksheet::{TempIoFailurePoint, Worksheet};
+
     #[test]
     fn test_assemble() {
         let mut workbook = Workbook::default();
@@ -126,5 +129,256 @@ mod workbook_tests {
         let result = workbook.use_custom_theme(theme_file);
 
         assert!(matches!(result, Err(XlsxError::ThemeError(_))));
+    }
+
+    #[cfg(feature = "constant_memory")]
+    fn assert_storage_full(error: XlsxError) {
+        let XlsxError::IoError(source) = error else {
+            panic!("expected IoError");
+        };
+        assert_eq!(source.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(source.raw_os_error(), Some(112));
+    }
+
+    #[cfg(feature = "constant_memory")]
+    fn assert_create_failure_is_recoverable(worksheet: &mut Worksheet) {
+        worksheet.file_writer.failure_point = Some(TempIoFailurePoint::Create);
+        worksheet.write_number(0, 0, 1).unwrap();
+
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            worksheet.write_number(1, 0, 2).map(|_| ())
+        }));
+        assert!(outcome.is_ok(), "temporary file creation must not panic");
+        let error = match outcome.unwrap() {
+            Ok(_) => panic!("expected temporary file creation failure"),
+            Err(error) => error,
+        };
+        assert_storage_full(error);
+    }
+
+    #[cfg(feature = "constant_memory")]
+    fn assert_save_failure_is_recoverable(failure_point: TempIoFailurePoint) {
+        let mut workbook = Workbook::new();
+        let worksheet = workbook.add_worksheet_with_low_memory();
+        worksheet.write_number(0, 0, 1).unwrap();
+        worksheet.file_writer.failure_point = Some(failure_point);
+
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| workbook.save_to_buffer()));
+        assert!(outcome.is_ok(), "temporary file I/O must not panic");
+        let error = outcome
+            .unwrap()
+            .expect_err("expected temporary file I/O failure");
+        assert_storage_full(error);
+    }
+
+    #[cfg(feature = "constant_memory")]
+    fn read_sheet_xml(buffer: Vec<u8>) -> String {
+        use std::io::Read;
+
+        let mut archive = zip::ZipArchive::new(std::io::Cursor::new(buffer)).unwrap();
+        let mut xml = String::new();
+        archive
+            .by_name("xl/worksheets/sheet1.xml")
+            .unwrap()
+            .read_to_string(&mut xml)
+            .unwrap();
+        xml
+    }
+
+    #[test]
+    #[cfg(feature = "constant_memory")]
+    fn standard_worksheet_never_initializes_temp_writer() {
+        let mut worksheet = Worksheet::new();
+        assert!(!worksheet.file_writer.is_initialized());
+
+        worksheet.write_number(0, 0, 1).unwrap();
+        worksheet.write_number(1, 0, 2).unwrap();
+
+        assert!(!worksheet.file_writer.is_initialized());
+    }
+
+    #[test]
+    #[cfg(feature = "constant_memory")]
+    fn all_memory_factories_defer_tempfile_creation() {
+        let mut workbook = Workbook::new();
+        assert!(!workbook
+            .add_worksheet_with_constant_memory()
+            .file_writer
+            .is_initialized());
+
+        let mut workbook = Workbook::new();
+        assert!(!workbook
+            .add_worksheet_with_low_memory()
+            .file_writer
+            .is_initialized());
+
+        let mut workbook = Workbook::new();
+        assert!(!workbook
+            .new_worksheet_with_constant_memory()
+            .file_writer
+            .is_initialized());
+
+        let mut workbook = Workbook::new();
+        assert!(!workbook
+            .new_worksheet_with_low_memory()
+            .file_writer
+            .is_initialized());
+    }
+
+    #[test]
+    #[cfg(feature = "constant_memory")]
+    fn add_constant_memory_create_failure_is_recoverable() {
+        let mut workbook = Workbook::new();
+        assert_create_failure_is_recoverable(workbook.add_worksheet_with_constant_memory());
+    }
+
+    #[test]
+    #[cfg(feature = "constant_memory")]
+    fn add_low_memory_create_failure_is_recoverable() {
+        let mut workbook = Workbook::new();
+        assert_create_failure_is_recoverable(workbook.add_worksheet_with_low_memory());
+    }
+
+    #[test]
+    #[cfg(feature = "constant_memory")]
+    fn new_constant_memory_create_failure_is_recoverable() {
+        let mut workbook = Workbook::new();
+        let mut worksheet = workbook.new_worksheet_with_constant_memory();
+        assert_create_failure_is_recoverable(&mut worksheet);
+    }
+
+    #[test]
+    #[cfg(feature = "constant_memory")]
+    fn new_low_memory_create_failure_is_recoverable() {
+        let mut workbook = Workbook::new();
+        let mut worksheet = workbook.new_worksheet_with_low_memory();
+        assert_create_failure_is_recoverable(&mut worksheet);
+    }
+
+    #[test]
+    #[cfg(feature = "constant_memory")]
+    fn flush_failure_returns_original_io_error() {
+        assert_save_failure_is_recoverable(TempIoFailurePoint::Flush);
+    }
+
+    #[test]
+    #[cfg(feature = "constant_memory")]
+    fn rewind_failure_returns_original_io_error() {
+        assert_save_failure_is_recoverable(TempIoFailurePoint::Rewind);
+    }
+
+    #[test]
+    #[cfg(feature = "constant_memory")]
+    fn packager_copy_failure_returns_original_io_error() {
+        assert_save_failure_is_recoverable(TempIoFailurePoint::ReadDuringCopy);
+    }
+
+    #[test]
+    #[cfg(feature = "constant_memory")]
+    fn removed_tempdir_after_set_tempdir_returns_io_error() {
+        let root = tempfile::tempdir().unwrap();
+        let controlled_tempdir = root.path().join("controlled");
+        std::fs::create_dir(&controlled_tempdir).unwrap();
+
+        let mut workbook = Workbook::new();
+        workbook.set_tempdir(&controlled_tempdir).unwrap();
+        std::fs::remove_dir(&controlled_tempdir).unwrap();
+        let expected = tempfile::tempfile_in(&controlled_tempdir).unwrap_err();
+
+        let worksheet = workbook.add_worksheet_with_low_memory();
+        worksheet.write_number(0, 0, 1).unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            worksheet.write_number(1, 0, 2).map(|_| ())
+        }));
+        assert!(outcome.is_ok(), "removed tempdir must not panic");
+        let error = match outcome.unwrap() {
+            Ok(_) => panic!("expected removed tempdir I/O failure"),
+            Err(error) => error,
+        };
+        let XlsxError::IoError(source) = error else {
+            panic!("expected IoError");
+        };
+        assert_eq!(source.kind(), expected.kind());
+        assert_eq!(source.raw_os_error(), expected.raw_os_error());
+    }
+
+    #[test]
+    #[cfg(feature = "constant_memory")]
+    fn empty_single_and_multi_row_low_memory_sheets_round_trip() {
+        let mut empty = Workbook::new();
+        empty.add_worksheet_with_low_memory();
+        let empty_xml = read_sheet_xml(empty.save_to_buffer().unwrap());
+        assert!(empty_xml.contains("<sheetData"));
+        assert!(!empty_xml.contains("<row"));
+
+        let mut single = Workbook::new();
+        single
+            .add_worksheet_with_low_memory()
+            .write_number(0, 0, 1)
+            .unwrap();
+        let single_xml = read_sheet_xml(single.save_to_buffer().unwrap());
+        assert!(single_xml.contains("<v>1</v>"));
+        assert_eq!(single_xml.matches("<row").count(), 1);
+
+        let mut multi = Workbook::new();
+        let worksheet = multi.add_worksheet_with_low_memory();
+        worksheet.write_number(0, 0, 1).unwrap();
+        worksheet.write_number(1, 0, 2).unwrap();
+        worksheet.write_number(2, 0, 3).unwrap();
+        let multi_xml = read_sheet_xml(multi.save_to_buffer().unwrap());
+        assert!(multi_xml.contains("<v>1</v>"));
+        assert!(multi_xml.contains("<v>2</v>"));
+        assert!(multi_xml.contains("<v>3</v>"));
+        assert_eq!(multi_xml.matches("<row").count(), 3);
+    }
+
+    #[test]
+    #[cfg(feature = "constant_memory")]
+    fn controlled_tempdir_does_not_touch_process_temp_canary() {
+        const CHILD_MARKER: &str = "RUST_XLSXWRITER_TEMP_CANARY_CHILD";
+        const CONTROLLED_DIR: &str = "RUST_XLSXWRITER_CONTROLLED_TEMPDIR";
+
+        if std::env::var_os(CHILD_MARKER).is_some() {
+            let controlled_tempdir = std::path::PathBuf::from(
+                std::env::var_os(CONTROLLED_DIR).expect("controlled tempdir is set"),
+            );
+
+            let mut workbook = Workbook::new();
+            workbook
+                .add_worksheet()
+                .write_string(0, 0, "standard")
+                .unwrap();
+            workbook.set_tempdir(&controlled_tempdir).unwrap();
+            let worksheet = workbook.add_worksheet_with_low_memory();
+            worksheet.write_string(0, 0, "low memory").unwrap();
+            workbook.save_to_buffer().unwrap();
+            return;
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let controlled_tempdir = root.path().join("controlled");
+        std::fs::create_dir(&controlled_tempdir).unwrap();
+        let canary = root.path().join("missing-process-temp");
+        let test_name = "workbook::tests::workbook_tests::controlled_tempdir_does_not_touch_process_temp_canary";
+
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg("--exact")
+            .arg(test_name)
+            .arg("--nocapture")
+            .env(CHILD_MARKER, "1")
+            .env(CONTROLLED_DIR, &controlled_tempdir)
+            .env("TEMP", &canary)
+            .env("TMP", &canary)
+            .env("TMPDIR", &canary)
+            .output()
+            .unwrap();
+
+        assert!(
+            output.status.success(),
+            "child process failed:\n{}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!canary.exists());
     }
 }

@@ -958,4 +958,51 @@ mod worksheet_tests {
 
         assert_eq!(expected, got);
     }
+
+    #[cfg(feature = "constant_memory")]
+    fn assert_storage_full(error: XlsxError) {
+        let XlsxError::IoError(source) = error else {
+            panic!("expected IoError");
+        };
+        assert_eq!(source.kind(), std::io::ErrorKind::StorageFull);
+        assert_eq!(source.raw_os_error(), Some(112));
+    }
+
+    #[test]
+    #[cfg(feature = "constant_memory")]
+    fn row_start_write_failure_returns_original_io_error() {
+        let mut worksheet = Worksheet::new();
+        worksheet.file_writer.failure_point = Some(TempIoFailurePoint::NextWrite);
+
+        worksheet.write_constant_table_row(0, None, true);
+
+        let error = worksheet.file_writer.take_write_error().unwrap();
+        assert_storage_full(XlsxError::IoError(error));
+    }
+
+    #[test]
+    #[cfg(feature = "constant_memory")]
+    fn cell_body_write_failure_returns_original_io_error() {
+        let mut worksheet = Worksheet::new();
+        worksheet.write_constant_table_row(0, None, true);
+        worksheet.file_writer.failure_point = Some(TempIoFailurePoint::NextWrite);
+
+        Worksheet::write_number_cell(&mut worksheet.file_writer, 1, "A", 1.0, 0);
+
+        let error = worksheet.file_writer.take_write_error().unwrap();
+        assert_storage_full(XlsxError::IoError(error));
+    }
+
+    #[test]
+    #[cfg(feature = "constant_memory")]
+    fn row_end_write_failure_returns_original_io_error() {
+        let mut worksheet = Worksheet::new();
+        worksheet.write_constant_table_row(0, None, true);
+        worksheet.file_writer.failure_point = Some(TempIoFailurePoint::NextWrite);
+
+        xml_end_tag(&mut worksheet.file_writer, "row");
+
+        let error = worksheet.file_writer.take_write_error().unwrap();
+        assert_storage_full(XlsxError::IoError(error));
+    }
 }

@@ -43,9 +43,6 @@
 use std::collections::HashSet;
 use std::io::Write;
 
-#[cfg(feature = "constant_memory")]
-use std::io::{BufReader, Seek};
-
 use std::sync::{Arc, Mutex};
 #[cfg(not(target_arch = "wasm32"))]
 use std::thread;
@@ -455,11 +452,9 @@ impl<W: Write + Send> Packager<W> {
             {
                 // Section 2. On disk cell data.
                 // We also need to flush the last remaining row.
-                worksheet.flush_last_row();
-
-                worksheet.file_writer.rewind().unwrap();
-                let mut reader = BufReader::new(worksheet.file_writer.get_ref());
-                std::io::copy(&mut reader, &mut self.zip)?;
+                worksheet.flush_last_row()?;
+                worksheet.file_writer.rewind_result()?;
+                std::io::copy(&mut worksheet.file_writer, &mut self.zip)?;
             }
 
             // Section 3. In memory metadata at end of the file.

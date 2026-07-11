@@ -1354,8 +1354,7 @@ mod tests;
 use std::borrow::Cow;
 use std::collections::btree_map::Entry;
 use std::collections::{BTreeMap, HashMap, HashSet};
-use std::io::Cursor;
-use std::io::Write;
+use std::io::{Cursor, Write};
 use std::mem;
 use std::sync::{Arc, Mutex, RwLock};
 use std::{cmp, fmt};
@@ -1364,7 +1363,7 @@ use std::{cmp, fmt};
 use tempfile::tempfile_in;
 
 #[cfg(feature = "constant_memory")]
-use std::io::BufWriter;
+use std::io::{BufWriter, Read, Seek, SeekFrom};
 
 #[cfg(feature = "constant_memory")]
 use std::fs::File;
@@ -1395,6 +1394,147 @@ use crate::xmlwriter::{
     xml_data_element, xml_data_element_only, xml_declaration, xml_empty_tag, xml_empty_tag_only,
     xml_end_tag, xml_raw_string, xml_start_tag, xml_start_tag_only, XML_WRITE_ERROR,
 };
+
+#[cfg(all(test, feature = "constant_memory"))]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum TempIoFailurePoint {
+    Create,
+    NextWrite,
+    Flush,
+    Rewind,
+    ReadDuringCopy,
+}
+
+#[cfg(feature = "constant_memory")]
+pub(crate) struct DeferredFileWriter {
+    writer: Option<BufWriter<File>>,
+    tempdir: Option<std::path::PathBuf>,
+    first_write_error: Option<std::io::Error>,
+    #[cfg(test)]
+    pub(crate) failure_point: Option<TempIoFailurePoint>,
+}
+
+#[cfg(feature = "constant_memory")]
+impl DeferredFileWriter {
+    fn new() -> Self {
+        Self {
+            writer: None,
+            tempdir: None,
+            first_write_error: None,
+            #[cfg(test)]
+            failure_point: None,
+        }
+    }
+
+    pub(crate) fn set_tempdir(&mut self, tempdir: Option<std::path::PathBuf>) {
+        self.tempdir = tempdir;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn is_initialized(&self) -> bool {
+        self.writer.is_some()
+    }
+
+    fn ensure_writer(&mut self) -> std::io::Result<&mut BufWriter<File>> {
+        if self.writer.is_none() {
+            #[cfg(test)]
+            if self.failure_point == Some(TempIoFailurePoint::Create) {
+                return Err(std::io::Error::from_raw_os_error(112));
+            }
+
+            let directory = self.tempdir.clone().unwrap_or_else(std::env::temp_dir);
+            self.writer = Some(BufWriter::new(tempfile_in(directory)?));
+        }
+
+        Ok(self.writer.as_mut().expect("writer initialized above"))
+    }
+
+    fn remember(&mut self, error: std::io::Error) {
+        if self.first_write_error.is_none() {
+            self.first_write_error = Some(error);
+        }
+    }
+
+    pub(crate) fn take_write_error(&mut self) -> Option<std::io::Error> {
+        self.first_write_error.take()
+    }
+
+    pub(crate) fn flush_result(&mut self) -> std::io::Result<()> {
+        if let Some(error) = self.take_write_error() {
+            return Err(error);
+        }
+
+        #[cfg(test)]
+        if self.failure_point == Some(TempIoFailurePoint::Flush) {
+            return Err(std::io::Error::from_raw_os_error(112));
+        }
+
+        self.ensure_writer()?.flush()
+    }
+
+    pub(crate) fn rewind_result(&mut self) -> std::io::Result<()> {
+        self.flush_result()?;
+
+        #[cfg(test)]
+        if self.failure_point == Some(TempIoFailurePoint::Rewind) {
+            return Err(std::io::Error::from_raw_os_error(112));
+        }
+
+        self.ensure_writer()?.seek(SeekFrom::Start(0)).map(|_| ())
+    }
+}
+
+#[cfg(feature = "constant_memory")]
+impl Write for DeferredFileWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        if self.first_write_error.is_some() {
+            return Ok(bytes.len());
+        }
+
+        #[cfg(test)]
+        if self.failure_point == Some(TempIoFailurePoint::NextWrite) {
+            self.remember(std::io::Error::from_raw_os_error(112));
+            return Ok(bytes.len());
+        }
+
+        match self
+            .ensure_writer()
+            .and_then(|writer| writer.write_all(bytes))
+        {
+            Ok(()) => Ok(bytes.len()),
+            Err(error) => {
+                self.remember(error);
+                Ok(bytes.len())
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.first_write_error.is_some() {
+            return Ok(());
+        }
+
+        match self.ensure_writer().and_then(BufWriter::flush) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.remember(error);
+                Ok(())
+            }
+        }
+    }
+}
+
+#[cfg(feature = "constant_memory")]
+impl Read for DeferredFileWriter {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        #[cfg(test)]
+        if self.failure_point == Some(TempIoFailurePoint::ReadDuringCopy) {
+            return Err(std::io::Error::from_raw_os_error(112));
+        }
+
+        self.ensure_writer()?.get_mut().read(buffer)
+    }
+}
 use crate::{
     utility, xmlwriter, Button, Chart, ChartEmptyCells, ChartRangeCacheData,
     ChartRangeCacheDataType, Color, ConditionalFormat, DataValidation, DataValidationErrorStyle,
@@ -1641,7 +1781,7 @@ pub struct Worksheet {
     max_autofit_row: RowNum,
 
     #[cfg(feature = "constant_memory")]
-    pub(crate) file_writer: BufWriter<File>,
+    pub(crate) file_writer: DeferredFileWriter,
 
     #[cfg(feature = "constant_memory")]
     write_ahead: BTreeMap<RowNum, BTreeMap<ColNum, CellType>>,
@@ -1739,7 +1879,7 @@ impl Worksheet {
         };
 
         #[cfg(feature = "constant_memory")]
-        let file_writer = BufWriter::new(tempfile_in(std::env::temp_dir()).unwrap());
+        let file_writer = DeferredFileWriter::new();
 
         Worksheet {
             writer,
@@ -15355,7 +15495,7 @@ impl Worksheet {
             CellType::Number { number, xf_index }
         };
 
-        self.insert_cell(row, col, cell);
+        self.insert_cell(row, col, cell)?;
 
         Ok(self)
     }
@@ -15419,7 +15559,7 @@ impl Worksheet {
             self.has_local_string_table = true;
         }
 
-        self.insert_cell(row, col, cell);
+        self.insert_cell(row, col, cell)?;
 
         Ok(self)
     }
@@ -15475,7 +15615,7 @@ impl Worksheet {
             string_id,
         };
 
-        self.insert_cell(row, col, cell);
+        self.insert_cell(row, col, cell)?;
 
         if !self.use_inline_strings {
             self.has_local_string_table = true;
@@ -15522,7 +15662,7 @@ impl Worksheet {
             result,
         };
 
-        self.insert_cell(row, col, cell);
+        self.insert_cell(row, col, cell)?;
 
         Ok(self)
     }
@@ -15586,7 +15726,7 @@ impl Worksheet {
             range: range.into_boxed_str(),
         };
 
-        self.insert_cell(first_row, first_col, cell);
+        self.insert_cell(first_row, first_col, cell)?;
 
         // Pad out the rest of the range with 0 result cells. We split this into
         // the first row and subsequent rows to allow us to handle "constant
@@ -15635,7 +15775,7 @@ impl Worksheet {
         // Create the appropriate cell type to hold the data.
         let cell = CellType::Blank { xf_index };
 
-        self.insert_cell(row, col, cell);
+        self.insert_cell(row, col, cell)?;
 
         Ok(self)
     }
@@ -15662,7 +15802,7 @@ impl Worksheet {
         // Create the appropriate cell type to hold the data.
         let cell = CellType::Boolean { boolean, xf_index };
 
-        self.insert_cell(row, col, cell);
+        self.insert_cell(row, col, cell)?;
 
         Ok(self)
     }
@@ -15757,7 +15897,7 @@ impl Worksheet {
         };
 
         // Store the cell error value.
-        self.insert_cell(row, col, cell);
+        self.insert_cell(row, col, cell)?;
 
         Ok(self)
     }
@@ -15827,7 +15967,7 @@ impl Worksheet {
     }
 
     // Insert a cell value into the worksheet data table structure.
-    fn insert_cell(&mut self, row: RowNum, col: ColNum, cell: CellType) {
+    fn insert_cell(&mut self, row: RowNum, col: ColNum, cell: CellType) -> Result<(), XlsxError> {
         if self.use_constant_memory {
             #[cfg(feature = "constant_memory")]
             {
@@ -15836,7 +15976,7 @@ impl Worksheet {
                     eprintln!(
                         "Ignoring write to previously written row {row} in 'constant memory' mode."
                     );
-                    return;
+                    return Ok(());
                 }
 
                 // If this is a new row then either buffer the data when writing
@@ -15845,10 +15985,10 @@ impl Worksheet {
                     if self.is_writing_ahead {
                         // Store cell in the write-ahead buffer.
                         Self::insert_cell_to_table(row, col, cell, &mut self.write_ahead);
-                        return;
+                        return Ok(());
                     }
 
-                    self.flush_to_row(row);
+                    self.flush_to_row(row)?;
                 }
 
                 // Store new constant memory data in the current row of the data table.
@@ -15858,6 +15998,8 @@ impl Worksheet {
             // In standard-memory mode all cell data is stored.
             Self::insert_cell_to_table(row, col, cell, &mut self.data_table);
         }
+
+        Ok(())
     }
 
     // Add a cell to one of the data tables.
@@ -18998,7 +19140,7 @@ impl Worksheet {
     // Flush the last row of constant memory data, the write-ahead cache and any
     // modified rows.
     #[cfg(feature = "constant_memory")]
-    pub(crate) fn flush_last_row(&mut self) {
+    pub(crate) fn flush_last_row(&mut self) -> Result<(), XlsxError> {
         // First find any write ahead cached rows.
         let mut remaining_rows: Vec<_> = self.write_ahead.keys().copied().collect();
 
@@ -19028,13 +19170,15 @@ impl Worksheet {
 
         // Flush all the remaining rows.
         for remaining_row in remaining_rows {
-            self.flush_data_row(remaining_row);
+            self.flush_data_row(remaining_row)?;
         }
+
+        Ok(())
     }
 
     // Flush all constant memory data up to the next target row.
     #[cfg(feature = "constant_memory")]
-    fn flush_to_row(&mut self, next_row: RowNum) {
+    fn flush_to_row(&mut self, next_row: RowNum) -> Result<(), XlsxError> {
         // First find any write ahead cached rows.
         let mut intermediate_rows: Vec<_> = self
             .write_ahead
@@ -19055,16 +19199,16 @@ impl Worksheet {
         intermediate_rows.dedup();
 
         for intermediate_row in intermediate_rows {
-            self.flush_data_row(intermediate_row);
+            self.flush_data_row(intermediate_row)?;
         }
 
-        self.flush_data_row(next_row);
+        self.flush_data_row(next_row)
     }
 
     // Write out all the row and cell data in the constant memory data table.
     #[allow(clippy::too_many_lines)]
     #[cfg(feature = "constant_memory")]
-    fn flush_data_row(&mut self, next_row: RowNum) {
+    fn flush_data_row(&mut self, next_row: RowNum) -> Result<(), XlsxError> {
         let current_row = self.current_row;
 
         // Swap out the worksheet data structures so we can iterate over them and
@@ -19091,7 +19235,11 @@ impl Worksheet {
             }
             self.current_row = next_row;
 
-            return;
+            if let Some(error) = self.file_writer.take_write_error() {
+                return Err(XlsxError::IoError(error));
+            }
+
+            return Ok(());
         };
 
         // The row has data. Write it out cell by cell.
@@ -19240,6 +19388,12 @@ impl Worksheet {
             self.data_table.insert(next_row, columns);
         }
         self.current_row = next_row;
+
+        if let Some(error) = self.file_writer.take_write_error() {
+            return Err(XlsxError::IoError(error));
+        }
+
+        Ok(())
     }
 
     // Calculate the "spans" attribute of the <row> tag. This is an xlsx

@@ -228,9 +228,6 @@ use zip::ZipArchive;
 use tempfile::tempfile_in;
 
 #[cfg(feature = "constant_memory")]
-use std::io::BufWriter;
-
-#[cfg(feature = "constant_memory")]
 use std::path::PathBuf;
 
 use crate::error::XlsxError;
@@ -585,12 +582,9 @@ impl Workbook {
 
         self.initialize_default_format(&mut worksheet);
 
-        if let Some(tempdir) = &self.tempdir {
-            worksheet.file_writer = BufWriter::new(tempfile_in(tempdir).unwrap());
-        }
-
         worksheet.use_inline_strings = true;
         worksheet.use_constant_memory = true;
+        worksheet.file_writer.set_tempdir(self.tempdir.clone());
 
         worksheet.workbook_xf_indices = Arc::clone(&self.xf_indices);
         worksheet.has_workbook_global_xfs = true;
@@ -660,12 +654,9 @@ impl Workbook {
 
         self.initialize_default_format(&mut worksheet);
 
-        if let Some(tempdir) = &self.tempdir {
-            worksheet.file_writer = BufWriter::new(tempfile_in(tempdir).unwrap());
-        }
-
         worksheet.use_inline_strings = false;
         worksheet.use_constant_memory = true;
+        worksheet.file_writer.set_tempdir(self.tempdir.clone());
 
         worksheet.workbook_xf_indices = Arc::clone(&self.xf_indices);
         worksheet.has_workbook_global_xfs = true;
@@ -708,12 +699,9 @@ impl Workbook {
     pub fn new_worksheet_with_constant_memory(&mut self) -> Worksheet {
         let mut worksheet = Worksheet::new();
 
-        if let Some(tempdir) = &self.tempdir {
-            worksheet.file_writer = BufWriter::new(tempfile_in(tempdir).unwrap());
-        }
-
         worksheet.use_inline_strings = true;
         worksheet.use_constant_memory = true;
+        worksheet.file_writer.set_tempdir(self.tempdir.clone());
 
         worksheet.workbook_xf_indices = Arc::clone(&self.xf_indices);
         worksheet.has_workbook_global_xfs = true;
@@ -750,12 +738,9 @@ impl Workbook {
     pub fn new_worksheet_with_low_memory(&mut self) -> Worksheet {
         let mut worksheet = Worksheet::new();
 
-        if let Some(tempdir) = &self.tempdir {
-            worksheet.file_writer = BufWriter::new(tempfile_in(tempdir).unwrap());
-        }
-
         worksheet.use_inline_strings = false;
         worksheet.use_constant_memory = true;
+        worksheet.file_writer.set_tempdir(self.tempdir.clone());
 
         worksheet.workbook_xf_indices = Arc::clone(&self.xf_indices);
         worksheet.has_workbook_global_xfs = true;
