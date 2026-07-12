@@ -350,6 +350,7 @@ pub struct Workbook {
     num_worksheets: u16,
     num_chartsheets: u16,
     use_large_file: bool,
+    compression_level: Option<u8>,
     default_format: Format,
     default_row_height: u32,
     default_col_width: u32,
@@ -439,6 +440,7 @@ impl Workbook {
             num_worksheets: 0,
             num_chartsheets: 0,
             use_large_file: false,
+            compression_level: None,
             feature_property_bags: HashSet::new(),
             default_format: Format::default(),
             default_row_height: 20,
@@ -2178,6 +2180,26 @@ impl Workbook {
         self
     }
 
+    /// Set the ZIP compression level used for XML and text files in the xlsx package.
+    ///
+    /// The supported range is 1 (fastest, larger output) through 9 (slowest,
+    /// smaller output). If this method isn't called, the ZIP backend's default
+    /// compression level is used. Binary files in the package remain uncompressed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`XlsxError::ParameterError`] when `level` is outside 1 through 9.
+    pub fn set_compression_level(&mut self, level: u8) -> Result<&mut Workbook, XlsxError> {
+        if !(1..=9).contains(&level) {
+            return Err(XlsxError::ParameterError(
+                "ZIP compression level must be in the range 1 to 9".to_string(),
+            ));
+        }
+
+        self.compression_level = Some(level);
+        Ok(self)
+    }
+
     /// Add a signed vba macro file to the workbook.
     ///
     /// The `add_vba_project_with_signature()` method can be used to add signed
@@ -2588,7 +2610,7 @@ impl Workbook {
         package_options = self.set_package_options(package_options)?;
 
         // Create the Packager object that will assemble the zip/xlsx file.
-        let packager = Packager::new(writer, self.use_large_file);
+        let packager = Packager::new(writer, self.use_large_file, self.compression_level);
         packager.assemble_file(self, &package_options)?;
 
         Ok(())

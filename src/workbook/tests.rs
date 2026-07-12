@@ -85,6 +85,25 @@ mod workbook_tests {
     }
 
     #[test]
+    fn compression_level_accepts_only_zip_backend_range() {
+        let mut workbook = Workbook::new();
+
+        assert_eq!(workbook.compression_level, None);
+        assert!(workbook.set_compression_level(1).is_ok());
+        assert_eq!(workbook.compression_level, Some(1));
+        assert!(workbook.set_compression_level(9).is_ok());
+        assert_eq!(workbook.compression_level, Some(9));
+        assert!(matches!(
+            workbook.set_compression_level(0),
+            Err(XlsxError::ParameterError(_))
+        ));
+        assert!(matches!(
+            workbook.set_compression_level(10),
+            Err(XlsxError::ParameterError(_))
+        ));
+    }
+
+    #[test]
     fn duplicate_tables() {
         let mut workbook = Workbook::default();
         let worksheet = workbook.add_worksheet();
